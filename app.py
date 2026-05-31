@@ -242,7 +242,7 @@ def check_single_card(card_str):
     if len(yy) == 4: yy = yy[2:]
     card_info = f"{cc}|{mm}|{yy}|{cvc}"
     
-    max_retries = 1
+    max_retries = 3
     for attempt in range(max_retries):
         session = requests.Session()
         ua = random.choice(MODERN_UAS)
@@ -372,7 +372,7 @@ def mass_handler(message):
         else:
             error_count += 1
         
-        if (charged_count + dead_count + error_count) % 10 == 0:
+        if (charged_count + dead_count + error_count) % 5 == 0:
             update_summary()
     
     update_summary("𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲")
