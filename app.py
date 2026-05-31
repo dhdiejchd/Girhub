@@ -8,6 +8,7 @@ import os
 import json
 from faker import Faker
 from bs4 import BeautifulSoup
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 # Replace with your actual Telegram Bot Token
 API_TOKEN = '8075455874:AAGxl7ELCNce4BJtvMn8pDqb2TPr6oPPBrk'
@@ -200,10 +201,6 @@ def pay(session, ua, form_data, pm):
         r_confirm = session.post(confirm_url, headers=confirm_headers, data=confirm_data, timeout=20)
         confirm_res = r_confirm.json()
         
-        # Save response for debugging/extraction simulation if needed
-        with open('response.txt', 'w') as f:
-            f.write(json.dumps(confirm_res, indent=4))
-        
         if 'error' in confirm_res:
             err = confirm_res['error']
             decline_code = err.get('decline_code', err.get('code', 'unknown'))
@@ -332,14 +329,16 @@ def mass_handler(message):
 
     cards = cards[:2000]
     total_cards = len(cards)
-    charged_count, dead_count, error_count = 0, 0, 0
     
     summary_msg = bot.reply_to(message, "꒰ ⚡️ ꒱   𝗦𝗧𝗥𝗜𝗣𝗘 𝗠𝗔𝗦𝗦  —  𝗣𝗿𝗼𝗰𝗲𝘀𝘀𝗶𝗻𝗴...")
     
+    # Shared counters
+    results = {"charged": 0, "dead": 0, "error": 0}
+    
     def update_summary(status_label="𝗣𝗿𝗼𝗰𝗲𝘀𝘀𝗶𝗻𝗴..."):
         elapsed = time.time() - start_time
-        total_checked = charged_count + dead_count + error_count
-        hit_rate = (charged_count / total_checked * 100) if total_checked > 0 else 0
+        total_checked = results["charged"] + results["dead"] + results["error"]
+        hit_rate = (results["charged"] / total_checked * 100) if total_checked > 0 else 0
         text = (
             f"꒰ ⚡️ ꒱   𝗦𝗧𝗥𝗜𝗣𝗘 𝗠𝗔𝗦𝗦  —  {status_label}\n\n"
             "꒰ 🔄 ꒱   𝗦𝘂𝗺𝗺𝗮𝗿𝘆  ⤵\n"
@@ -347,33 +346,46 @@ def mass_handler(message):
             f"   ▸   𝗲𝗹𝗮𝗽𝘀𝗲𝗱  · {int(elapsed)}s\n"
             f"   ▸   𝗵𝗶𝘁 𝗿𝗮𝘁𝗲 · {hit_rate:.1f}%\n\n"
             "꒰ 📰 ꒱   𝗛𝗶𝘁 𝗖𝗼𝘂𝗻𝘁  ⤵\n"
-            f"   ▸   💰 𝗖𝗵𝗮𝗿𝗴𝗲𝗱  · {charged_count}\n"
-            f"   ▸   ❌ 𝗗𝗘𝗔𝗗     · {dead_count}\n"
-            f"   ▸   ⛔️ 𝗘𝗿𝗿𝗼𝗿    · {error_count}"
+            f"   ▸   💰 𝗖𝗵𝗮𝗿𝗴𝗲𝗱  · {results['charged']}\n"
+            f"   ▸   ❌ 𝗗𝗘𝗔𝗗     · {results['dead']}\n"
+            f"   ▸   ⛔️ 𝗘𝗿𝗿𝗼𝗿    · {results['error']}"
         )
         try: bot.edit_message_text(text, chat_id=message.chat.id, message_id=summary_msg.message_id)
         except: pass
 
-    for card_str in cards:
-        success, result_msg, card_info = check_single_card(card_str)
+    # Batch processing with 30 cards at a time
+    batch_size = 30
+    for i in range(0, total_cards, batch_size):
+        batch = cards[i:i + batch_size]
         
-        if success is True:
-            charged_count += 1
-            hit_text = (
-                "꒰ ✅ ꒱   𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱  —  𝗦𝘁𝗿𝗶𝗽𝗲 𝗠𝗔𝗦𝗦\n\n"
-                "꒰ 💰 ꒱  𝗖𝗮𝗿𝗱\n"
-                f"   ▸  num  · {card_info}\n"
-                "   ▸  gate · 𝗦𝘁𝗿𝗶𝗽𝗲 1$\n"
-                f"   ▸  resp · {result_msg}\n"
-            )
-            bot.send_message(message.chat.id, hit_text)
-        elif success is False:
-            dead_count += 1
-        else:
-            error_count += 1
+        with ThreadPoolExecutor(max_workers=batch_size) as executor:
+            future_to_card = {executor.submit(check_single_card, card): card for card in batch}
+            
+            for future in as_completed(future_to_card):
+                try:
+                    success, result_msg, card_info = future.result()
+                    if success is True:
+                        results["charged"] += 1
+                        hit_text = (
+                            "꒰ ✅ ꒱   𝗔𝗽𝗽𝗿𝗼𝘃𝗲𝗱  —  𝗦𝘁𝗿𝗶𝗽𝗲 𝗠𝗔𝗦𝗦\n\n"
+                            "꒰ 💰 ꒱  𝗖𝗮𝗿𝗱\n"
+                            f"   ▸  num  · {card_info}\n"
+                            "   ▸  gate · 𝗦𝘁𝗿𝗶𝗽𝗲 1$\n"
+                            f"   ▸  resp · {result_msg}\n"
+                        )
+                        bot.send_message(message.chat.id, hit_text)
+                    elif success is False:
+                        results["dead"] += 1
+                    else:
+                        results["error"] += 1
+                except Exception as e:
+                    results["error"] += 1
+                    print(f"Error in thread: {e}")
         
-        if (charged_count + dead_count + error_count) % 5 == 0:
-            update_summary()
+        # Update summary after each batch
+        update_summary()
+        # Optional: Add a small delay between batches to avoid rate limiting
+        time.sleep(2)
     
     update_summary("𝗖𝗼𝗺𝗽𝗹𝗲𝘁𝗲")
 
